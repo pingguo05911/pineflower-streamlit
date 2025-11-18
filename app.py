@@ -53,7 +53,7 @@ class StreamlitDetector:
             if self.model is not None:
                 st.write("✅ Using PMC_PhaseNet model for detection...")
 
-                # Perform detection
+                # Perform detection - YOLO can handle PIL Images directly
                 results = self.model(image)
                 st.write(f"📊 PMC_PhaseNet returned {len(results)} detection results")
 
@@ -75,7 +75,7 @@ class StreamlitDetector:
                             st.write(f"     Location: [{bbox[0]:.1f}, {bbox[1]:.1f}, {bbox[2]:.1f}, {bbox[3]:.1f}]")
 
                             class_info = PINE_FLOWER_CLASSES.get(class_id, {
-                                'name': 'unknown', 'color': (255, 255, 255), 'display_name': 'Unknown Stage'
+                                'name': 'unknown', 'color': (255, 165, 0), 'display_name': 'Unknown Stage'
                             })
 
                             detections.append({
@@ -115,21 +115,21 @@ class StreamlitDetector:
             st.warning("⚠️ No detection boxes to draw, returning original image")
             return image
 
-        # Convert numpy array to PIL Image if needed
+        # Create a copy of the image to draw on
         if isinstance(image, np.ndarray):
-            if image.shape[2] == 3:  # RGB
-                pil_image = Image.fromarray(image.astype('uint8'), 'RGB')
-            else:  # BGR to RGB
-                pil_image = Image.fromarray(image[:, :, ::-1].astype('uint8'), 'RGB')
+            # Convert numpy array to PIL Image
+            pil_image = Image.fromarray(image.astype('uint8'))
         else:
             pil_image = image.copy()
 
         draw = ImageDraw.Draw(pil_image)
         
-        # Try to load font, fallback to default if not available
+        # Use default font
         try:
-            font = ImageFont.truetype("Arial.ttf", 20)
+            # Try to load a font
+            font = ImageFont.truetype("Arial.ttf", 16)
         except:
+            # Use default font if Arial is not available
             font = ImageFont.load_default()
 
         image_width, image_height = pil_image.size
@@ -153,28 +153,33 @@ class StreamlitDetector:
             if x1 < 0 or y1 < 0 or x2 > image_width or y2 > image_height:
                 st.warning(f"     ⚠️ Coordinates partially outside image boundaries")
 
-            # Draw detection box
-            draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
+            # Draw detection box (thicker border)
+            draw.rectangle([x1, y1, x2, y2], outline=color, width=4)
             st.write(f"     ✅ Bounding box drawn")
 
-            # Draw label background and text
+            # Draw label
             label = f"{display_name} {conf:.2f}"
             
             # Estimate text size
-            bbox = draw.textbbox((0, 0), label, font=font)
-            text_width = bbox[2] - bbox[0]
-            text_height = bbox[3] - bbox[1]
+            try:
+                bbox = draw.textbbox((0, 0), label, font=font)
+                text_width = bbox[2] - bbox[0]
+                text_height = bbox[3] - bbox[1]
+            except:
+                # Fallback if textbbox fails
+                text_width = len(label) * 8
+                text_height = 16
 
+            # Calculate label position
+            label_y = max(y1 - text_height - 5, 5)
+            
             # Draw label background
-            label_bg = [x1, max(y1 - text_height - 10, 0), 
-                       x1 + text_width + 10, y1]
-            draw.rectangle(label_bg, fill=color)
-            st.write(f"     ✅ Label background drawn")
-
-            # Draw text
-            text_position = (x1 + 5, max(y1 - text_height - 5, 5))
-            draw.text(text_position, label, fill=(255, 255, 255), font=font)
-            st.write(f"     ✅ Text label drawn")
+            draw.rectangle([x1, label_y, x1 + text_width + 10, label_y + text_height + 5], 
+                         fill=color)
+            
+            # Draw label text
+            draw.text((x1 + 5, label_y + 2), label, fill=(255, 255, 255), font=font)
+            st.write(f"     ✅ Label drawn")
 
         st.success("🎨 All detection boxes drawn successfully!")
         return pil_image
@@ -259,43 +264,51 @@ def main():
 
         if st.button("Start Detection", type="primary"):
             with st.spinner("Processing..."):
-                # Image processing
-                image = Image.open(uploaded_file)
-                image_np = np.array(image)
+                try:
+                    # Load image using PIL
+                    image = Image.open(uploaded_file).convert('RGB')
+                    
+                    # Display original image
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.subheader("Original Image")
+                        st.image(image, use_container_width=True)
 
-                # Display original image
-                st.subheader("Original Image")
-                st.image(image, use_container_width=True)
+                    # Detection
+                    detections, result_image = detector.detect_image(image)
 
-                # Detection
-                detections, result_image = detector.detect_image(image_np)
+                    # Display results
+                    with col2:
+                        st.subheader("Detection Result")
+                        st.image(result_image, use_container_width=True)
 
-                # Display results
-                st.subheader("Detection Result")
-                st.image(result_image, use_container_width=True)
+                    # Display statistics
+                    st.subheader("📊 Detection Statistics")
+                    stats = detector.get_statistics(detections)
 
-                # Display statistics
-                st.subheader("📊 Detection Statistics")
-                stats = detector.get_statistics(detections)
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("Total Detections", stats['total_count'])
 
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.metric("Total Detections", stats['total_count'])
+                    with col2:
+                        for stage, count in stats['by_stage'].items():
+                            st.metric(f"{stage}", count)
 
-                with col2:
-                    for stage, count in stats['by_stage'].items():
-                        st.metric(f"{stage}", count)
+                    # Display detection details
+                    st.subheader("🔍 Detection Details")
+                    if detections:
+                        for i, det in enumerate(detections):
+                            st.write(
+                                f"**Pine Flower {i + 1}**: {det['display_name']} (Confidence: {det['confidence']:.2f})")
+                    else:
+                        st.info("No pine flowers detected")
 
-                # Display detection details
-                st.subheader("🔍 Detection Details")
-                if detections:
-                    for i, det in enumerate(detections):
-                        st.write(
-                            f"**Pine Flower {i + 1}**: {det['display_name']} (Confidence: {det['confidence']:.2f})")
-                else:
-                    st.info("No pine flowers detected")
-
-                st.success(f"Detection completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                    st.success(f"Detection completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                    
+                except Exception as e:
+                    st.error(f"Error processing image: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
 
 
 if __name__ == "__main__":
