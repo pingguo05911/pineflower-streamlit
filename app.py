@@ -1,11 +1,12 @@
 import streamlit as st
-import cv2
 import numpy as np
 import tempfile
 import os
 from datetime import datetime
 from collections import defaultdict
 from ultralytics import YOLO
+from PIL import Image, ImageDraw, ImageFont
+import io
 
 # Page configuration
 st.set_page_config(
@@ -24,8 +25,8 @@ else:
 # Pine flower phenology classes mapping
 PINE_FLOWER_CLASSES = {
     0: {'name': 'elongation stage', 'color': (0, 255, 0), 'display_name': 'Elongation Stage'},
-    1: {'name': 'ripening stage', 'color': (0, 165, 255), 'display_name': 'Ripening Stage'},
-    2: {'name': 'decline stage', 'color': (0, 0, 255), 'display_name': 'Decline Stage'}
+    1: {'name': 'ripening stage', 'color': (255, 165, 0), 'display_name': 'Ripening Stage'},
+    2: {'name': 'decline stage', 'color': (255, 0, 0), 'display_name': 'Decline Stage'}
 }
 
 
@@ -48,7 +49,6 @@ class StreamlitDetector:
         try:
             st.write("---")
             st.write("🔍 **Starting detection process**")
-            st.write(f"📐 Input image dimensions: {image.shape}")
 
             if self.model is not None:
                 st.write("✅ Using PMC_PhaseNet model for detection...")
@@ -97,7 +97,7 @@ class StreamlitDetector:
 
             # Draw detection results
             st.write("🖌️ Starting to draw detection boxes...")
-            result_image = self.draw_detections(image.copy(), detections)
+            result_image = self.draw_detections(image, detections)
             return detections, result_image
 
         except Exception as e:
@@ -107,86 +107,85 @@ class StreamlitDetector:
             st.code(traceback.format_exc())
             return self.mock_detect(image), image
 
-    def detect_video(self, video_path):
-        """Perform video detection"""
+    def draw_detections(self, image, detections):
+        """Draw detection boxes on image using PIL"""
+        st.write(f"🖌️ Need to draw {len(detections)} detection boxes")
+
+        if len(detections) == 0:
+            st.warning("⚠️ No detection boxes to draw, returning original image")
+            return image
+
+        # Convert numpy array to PIL Image if needed
+        if isinstance(image, np.ndarray):
+            if image.shape[2] == 3:  # RGB
+                pil_image = Image.fromarray(image.astype('uint8'), 'RGB')
+            else:  # BGR to RGB
+                pil_image = Image.fromarray(image[:, :, ::-1].astype('uint8'), 'RGB')
+        else:
+            pil_image = image.copy()
+
+        draw = ImageDraw.Draw(pil_image)
+        
+        # Try to load font, fallback to default if not available
         try:
-            cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
-                st.error("Cannot open video file")
-                return [], None
+            font = ImageFont.truetype("Arial.ttf", 20)
+        except:
+            font = ImageFont.load_default()
 
-            # Create temporary output file
-            output_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
+        image_width, image_height = pil_image.size
+        st.write(f"📏 Canvas dimensions: width={image_width}, height={image_height}")
 
-            fps = int(cap.get(cv2.CAP_PROP_FPS))
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        for i, det in enumerate(detections):
+            x1, y1, x2, y2 = map(int, det['bbox'])
+            conf = det['confidence']
+            color = det.get('color', (0, 255, 0))
+            display_name = det['display_name']
 
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+            st.write(f"  🎨 Drawing box {i + 1}: {display_name}")
+            st.write(f"     Confidence: {conf:.2f}")
+            st.write(f"     Coordinates: [{x1}, {y1}, {x2}, {y2}]")
 
-            progress_bar = st.progress(0)
-            status_text = st.empty()
+            # Check if coordinates are valid
+            if x1 >= x2 or y1 >= y2:
+                st.error(f"     ❌ Invalid coordinates: x1>=x2 or y1>=y2")
+                continue
 
-            frame_count = 0
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            video_detections = []
+            if x1 < 0 or y1 < 0 or x2 > image_width or y2 > image_height:
+                st.warning(f"     ⚠️ Coordinates partially outside image boundaries")
 
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
+            # Draw detection box
+            draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
+            st.write(f"     ✅ Bounding box drawn")
 
-                # Update progress
-                if frame_count % 10 == 0:
-                    progress = frame_count / total_frames
-                    progress_bar.progress(progress)
-                    status_text.text(f"Processing frame {frame_count}/{total_frames}")
+            # Draw label background and text
+            label = f"{display_name} {conf:.2f}"
+            
+            # Estimate text size
+            bbox = draw.textbbox((0, 0), label, font=font)
+            text_width = bbox[2] - bbox[0]
+            text_height = bbox[3] - bbox[1]
 
-                # Detect every 5 frames
-                if frame_count % 5 == 0:
-                    if self.model is not None:
-                        results = self.model(frame)
-                        frame_detections = []
-                        for result in results:
-                            for box in result.boxes:
-                                class_id = int(box.cls.item())
-                                class_info = PINE_FLOWER_CLASSES.get(class_id, {
-                                    'name': 'unknown', 'color': (255, 255, 255), 'display_name': 'Unknown Stage'
-                                })
+            # Draw label background
+            label_bg = [x1, max(y1 - text_height - 10, 0), 
+                       x1 + text_width + 10, y1]
+            draw.rectangle(label_bg, fill=color)
+            st.write(f"     ✅ Label background drawn")
 
-                                frame_detections.append({
-                                    'bbox': box.xyxy[0].tolist(),
-                                    'confidence': box.conf.item(),
-                                    'class_name': class_info['name'],
-                                    'display_name': class_info['display_name'],
-                                    'class_id': class_id,
-                                    'color': class_info['color']
-                                })
-                    else:
-                        frame_detections = self.mock_detect(frame)
+            # Draw text
+            text_position = (x1 + 5, max(y1 - text_height - 5, 5))
+            draw.text(text_position, label, fill=(255, 255, 255), font=font)
+            st.write(f"     ✅ Text label drawn")
 
-                    video_detections.extend(frame_detections)
-
-                # Draw detection boxes
-                result_frame = self.draw_detections(frame.copy(), frame_detections if frame_count % 5 == 0 else [])
-                out.write(result_frame)
-                frame_count += 1
-
-            cap.release()
-            out.release()
-            progress_bar.progress(1.0)
-            status_text.text("Processing completed!")
-
-            return video_detections, output_path
-
-        except Exception as e:
-            st.error(f"Video processing failed: {e}")
-            return [], None
+        st.success("🎨 All detection boxes drawn successfully!")
+        return pil_image
 
     def mock_detect(self, image):
         """Simulated detection for testing"""
-        height, width = image.shape[:2]
+        if isinstance(image, np.ndarray):
+            height, width = image.shape[:2]
+        else:
+            width, height = image.size
+            
         detections = []
         import random
         num_detections = random.randint(2, 4)
@@ -209,61 +208,6 @@ class StreamlitDetector:
                 'color': class_info['color']
             })
         return detections
-
-    def draw_detections(self, image, detections):
-        """Draw detection boxes on image"""
-        st.write(f"🖌️ Need to draw {len(detections)} detection boxes")
-
-        if len(detections) == 0:
-            st.warning("⚠️ No detection boxes to draw, returning original image")
-            return image
-
-        # Get image dimensions
-        image_height, image_width = image.shape[:2]
-        st.write(f"📏 Canvas dimensions: width={image_width}, height={image_height}")
-
-        for i, det in enumerate(detections):
-            x1, y1, x2, y2 = map(int, det['bbox'])
-            conf = det['confidence']
-            color = det.get('color', (0, 255, 0))
-            display_name = det['display_name']
-
-            st.write(f"  🎨 Drawing box {i + 1}: {display_name}")
-            st.write(f"     Confidence: {conf:.2f}")
-            st.write(f"     Coordinates: [{x1}, {y1}, {x2}, {y2}]")
-
-            # Check if coordinates are valid
-            if x1 >= x2 or y1 >= y2:
-                st.error(f"     ❌ Invalid coordinates: x1>=x2 or y1>=y2")
-                continue
-
-            if x1 < 0 or y1 < 0 or x2 > image_width or y2 > image_height:
-                st.warning(f"     ⚠️ Coordinates partially outside image boundaries")
-
-            # Draw detection box
-            cv2.rectangle(image, (x1, y1), (x2, y2), color, 3)
-            st.write(f"     ✅ Bounding box drawn")
-
-            # Draw label background
-            label = f"{display_name} {conf:.2f}"
-            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-
-            # Calculate label position (ensure it doesn't go beyond top boundary)
-            label_bg_y1 = max(y1 - label_size[1] - 10, 0)
-            label_bg_y2 = y1
-            label_bg_x2 = x1 + label_size[0] + 5
-
-            cv2.rectangle(image, (x1, label_bg_y1), (label_bg_x2, label_bg_y2), color, -1)
-            st.write(f"     ✅ Label background drawn")
-
-            # Draw text
-            text_y = max(y1 - 5, label_size[1] - 5)
-            cv2.putText(image, label, (x1, text_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            st.write(f"     ✅ Text label drawn")
-
-        st.success("🎨 All detection boxes drawn successfully!")
-        return image
 
     def get_statistics(self, detections):
         """Get detection statistics"""
@@ -296,9 +240,9 @@ def main():
 
     # File upload
     uploaded_file = st.file_uploader(
-        "Choose an image or video file",
-        type=['png', 'jpg', 'jpeg', 'mp4', 'avi', 'mov'],
-        help="Supported formats: JPG, PNG, MP4, AVI, MOV"
+        "Choose an image file",
+        type=['png', 'jpg', 'jpeg'],
+        help="Supported formats: JPG, PNG, JPEG"
     )
 
     if uploaded_file is not None:
@@ -315,50 +259,20 @@ def main():
 
         if st.button("Start Detection", type="primary"):
             with st.spinner("Processing..."):
-                # Process based on file type
-                if uploaded_file.type.startswith('image'):
-                    # Image processing
-                    file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-                    image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-                    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                # Image processing
+                image = Image.open(uploaded_file)
+                image_np = np.array(image)
 
-                    # Detection
-                    detections, result_image = detector.detect_image(image)
-                    result_image_rgb = cv2.cvtColor(result_image, cv2.COLOR_BGR2RGB)
+                # Display original image
+                st.subheader("Original Image")
+                st.image(image, use_container_width=True)
 
-                    # Display results
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.subheader("Original Image")
-                        st.image(image_rgb, use_container_width=True)
-                    with col2:
-                        st.subheader("Detection Result")
-                        st.image(result_image_rgb, use_container_width=True)
+                # Detection
+                detections, result_image = detector.detect_image(image_np)
 
-                elif uploaded_file.type.startswith('video'):
-                    # Video processing
-                    with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
-                        tmp_file.write(uploaded_file.read())
-                        tmp_path = tmp_file.name
-
-                    # Detection
-                    detections, result_path = detector.detect_video(tmp_path)
-
-                    # Display results
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.subheader("Original Video")
-                        st.video(uploaded_file)
-                    with col2:
-                        st.subheader("Detection Result")
-                        if result_path:
-                            with open(result_path, 'rb') as f:
-                                st.video(f.read())
-
-                    # Clean up temporary files
-                    os.unlink(tmp_path)
-                    if result_path and os.path.exists(result_path):
-                        os.unlink(result_path)
+                # Display results
+                st.subheader("Detection Result")
+                st.image(result_image, use_container_width=True)
 
                 # Display statistics
                 st.subheader("📊 Detection Statistics")
